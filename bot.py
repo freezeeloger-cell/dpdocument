@@ -21,6 +21,7 @@ from centers import CENTERS, COUNTRIES, by_country, title, url
 from checker import run_once
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # не светить токен в логах
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -28,6 +29,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 POLL_MIN = int(os.environ.get("POLL_INTERVAL_MIN", "120"))  # сек
 POLL_MAX = int(os.environ.get("POLL_INTERVAL_MAX", "240"))
+GROUP_URL = os.environ.get("GROUP_URL", "https://t.me/DpdocSupport")
+NUDGE_HOURS = int(os.environ.get("NUDGE_HOURS", "48"))
 
 
 # ---------- db ----------
@@ -46,6 +49,8 @@ def init_db():
                 first_name TEXT,
                 created_at TIMESTAMPTZ DEFAULT now()
             );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_notified_at TIMESTAMPTZ;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS nudged BOOLEAN DEFAULT FALSE;
             CREATE TABLE IF NOT EXISTS subs (
                 chat_id BIGINT,
                 center TEXT,
@@ -120,7 +125,10 @@ def kb_countries(chat_id):
     for i, c in enumerate(COUNTRIES):
         n = sum(1 for s in by_country(c) if s in mine)
         btns.append(InlineKeyboardButton(c + (f" ({n})" if n else ""), callback_data=f"c:{i}"))
-    return InlineKeyboardMarkup(_grid(btns, 2))
+    rows = _grid(btns, 2)
+    if mine:
+        rows.append([InlineKeyboardButton("🔔 Получать уведомления", callback_data="done")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_cities(chat_id, country):
@@ -129,6 +137,14 @@ def kb_cities(chat_id, country):
             for sub, (_, city, _) in by_country(country).items()]
     rows = _grid(btns, 2)
     rows.append([InlineKeyboardButton("◀️ Страны", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_group(extra: list[InlineKeyboardButton] | None = None):
+    rows = []
+    if extra:
+        rows.append(extra)
+    rows.append([InlineKeyboardButton("💬 Группа с ответами по документам", url=GROUP_URL)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -194,7 +210,24 @@ async def on_callback(update: Update, ctx):
         await cq.message.edit_text(f"{country} — выбери город (можно несколько):", reply_markup=kb_cities(cid, country))
     elif data == "back":
         await cq.answer()
-        await cq.message.edit_text(my_list(cid) + "\n\nВыбери страну:", reply_markup=kb_countries(cid))
+        await cq.message.edit_text(my_list(cid) + "\n\nВыбери страну или нажми «Получать уведомления»:",
+                                   reply_markup=kb_countries(cid))
+    elif data == "done":
+        mine = user_centers(cid)
+        if not mine:
+            return await cq.answer("Сначала выбери хотя бы один город", show_alert=True)
+        await cq.answer()
+        await cq.message.edit_text(my_list(cid))
+        await cq.message.reply_text(
+            "✅ Всё включено.\n\n"
+            "Я проверяю очередь каждые пару минут. Как только в твоих центрах появятся свободные слоты — "
+            "сразу пришлю ссылку. Новые талоны обычно выкладывают в течение дня, в случайное время, "
+            "поэтому держи уведомления включёнными.\n\n"
+            "Бронируешь ты сам на сайте — для зарубежных центров нужна Дія или BankID.\n\n"
+            "Вопросы по документам, записи, Дії или BankID — в нашей группе, там отвечают.\n\n"
+            "/centers — поменять города · /status — что я вижу сейчас · /stop — отписаться",
+            reply_markup=kb_group(),
+        )
     elif data.startswith("t:"):
         sub = data[2:]
         if sub not in CENTERS:
@@ -211,13 +244,16 @@ async def notify(app: Application, center: str, new_days: set[str], all_days: di
         t = all_days[d]
         lines.append(("🆕 " if d in new_days else "") + d
                      + (f": {', '.join(t[:8])}{'…' if len(t) > 8 else ''}" if t else ""))
-    lines.append(f"\n👉 <a href=\"{url(center)}\">Записаться на сайте</a>\n"
-                 f"<i>Слоты разбирают быстро. Для зарубежных центров нужна верификация через Дію или BankID.</i>")
+    lines.append("\n<i>Слоты разбирают быстро. Для зарубежных центров нужна верификация через Дію или BankID. "
+                 "Вопросы — в группе.</i>")
     text = "\n".join(lines)
+    markup = kb_group([InlineKeyboardButton("📝 Записаться на сайте", url=url(center))])
     sent = 0
     for chat_id in subscribers(center):
         try:
-            await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                       disable_web_page_preview=True, reply_markup=markup)
+            q("UPDATE users SET last_notified_at=now() WHERE chat_id=%s", (chat_id,), fetch=False)
             sent += 1
             await asyncio.sleep(0.05)
         except Forbidden:
@@ -235,7 +271,11 @@ async def poll_loop(app: Application):
         try:
             centers = active_centers()
             if centers:
+                log.info("checking %d centers: %s", len(centers), ", ".join(centers))
                 results = await run_once(centers)
+                for c, res in results.items():
+                    if not isinstance(res, Exception):
+                        log.info("%s: %d days", c, len(res))
                 for c, res in results.items():
                     if isinstance(res, Exception):
                         fails[c] = fails.get(c, 0) + 1
@@ -255,8 +295,42 @@ async def poll_loop(app: Application):
         await asyncio.sleep(random.uniform(POLL_MIN, POLL_MAX))
 
 
+async def nudge_loop(app: Application):
+    """Один раз напомнить тем, кому за NUDGE_HOURS ни разу не пришло уведомление."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            rows = q("""
+                SELECT u.chat_id FROM users u
+                WHERE u.nudged = FALSE AND u.last_notified_at IS NULL
+                  AND EXISTS (SELECT 1 FROM subs s WHERE s.chat_id = u.chat_id)
+                  AND (SELECT MIN(created_at) FROM subs s WHERE s.chat_id = u.chat_id) < now() - (%s * interval '1 hour')
+            """, (NUDGE_HOURS,))
+            for (chat_id,) in rows:
+                try:
+                    await app.bot.send_message(
+                        chat_id,
+                        "Пока в твоих центрах слотов не было — я продолжаю следить, как появятся, сразу напишу.\n\n"
+                        "Пока ждёшь, проверь, что документы и Дія/BankID готовы — чтобы успеть забронировать, "
+                        "когда придёт уведомление. Вопросы — в группе.",
+                        reply_markup=kb_group(),
+                    )
+                except Forbidden:
+                    q("DELETE FROM subs WHERE chat_id=%s", (chat_id,), fetch=False)
+                except BadRequest as e:
+                    log.info("nudge %s failed: %s", chat_id, e)
+                q("UPDATE users SET nudged=TRUE WHERE chat_id=%s", (chat_id,), fetch=False)
+                await asyncio.sleep(0.05)
+        except Exception:  # noqa: BLE001
+            log.exception("nudge loop error")
+        await asyncio.sleep(3600)
+
+
 async def post_init(app: Application):
-    app.create_task(poll_loop(app))
+    loop = asyncio.get_running_loop()
+    loop.create_task(poll_loop(app))
+    loop.create_task(nudge_loop(app))
+    log.info("poll + nudge loops scheduled")
 
 
 def main():
