@@ -12,10 +12,11 @@ import time
 
 import psycopg2
 import psycopg2.extras
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.constants import ParseMode
 from telegram.error import Forbidden, BadRequest
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+                          MessageHandler, PreCheckoutQueryHandler, filters)
 
 from centers import CENTERS, COUNTRIES, by_country, title, url
 from checker import run_once
@@ -31,6 +32,9 @@ POLL_MIN = int(os.environ.get("POLL_INTERVAL_MIN", "120"))  # сек
 POLL_MAX = int(os.environ.get("POLL_INTERVAL_MAX", "240"))
 GROUP_URL = os.environ.get("GROUP_URL", "https://t.me/DpdocSupport")
 NUDGE_HOURS = int(os.environ.get("NUDGE_HOURS", "48"))
+STARS_PRICE = int(os.environ.get("STARS_PRICE", "2500"))      # ⭐ в месяц (лимит Telegram на подписку ~2500)
+PREMIUM_DAYS = int(os.environ.get("PREMIUM_DAYS", "30"))
+SUB_PERIOD = 30 * 24 * 60 * 60                                 # единственный разрешённый период подписки
 
 
 # ---------- db ----------
@@ -51,6 +55,12 @@ def init_db():
             );
             ALTER TABLE users ADD COLUMN IF NOT EXISTS last_notified_at TIMESTAMPTZ;
             ALTER TABLE users ADD COLUMN IF NOT EXISTS nudged BOOLEAN DEFAULT FALSE;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMPTZ;
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT, stars INT, charge_id TEXT, recurring BOOLEAN,
+                expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now()
+            );
             CREATE TABLE IF NOT EXISTS subs (
                 chat_id BIGINT,
                 center TEXT,
@@ -95,8 +105,29 @@ def toggle(chat_id, center) -> bool:
     return True
 
 
-def subscribers(center) -> list[int]:
-    return [r[0] for r in q("SELECT chat_id FROM subs WHERE center=%s", (center,))]
+def subscribers(center) -> list[tuple[int, bool]]:
+    """[(chat_id, is_premium)]"""
+    return [(r[0], bool(r[1])) for r in q(
+        "SELECT s.chat_id, (u.premium_until IS NOT NULL AND u.premium_until > now()) "
+        "FROM subs s LEFT JOIN users u ON u.chat_id = s.chat_id WHERE s.center=%s", (center,))]
+
+
+def is_premium(chat_id) -> bool:
+    r = q("SELECT premium_until > now() FROM users WHERE chat_id=%s", (chat_id,), one=True)
+    return bool(r and r[0])
+
+
+def premium_until(chat_id):
+    r = q("SELECT premium_until FROM users WHERE chat_id=%s", (chat_id,), one=True)
+    return r[0] if r else None
+
+
+def grant_premium(chat_id, days: int, until=None):
+    if until is not None:
+        q("UPDATE users SET premium_until=%s WHERE chat_id=%s", (until, chat_id), fetch=False)
+    else:
+        q("UPDATE users SET premium_until = GREATEST(COALESCE(premium_until, now()), now()) + (%s * interval '1 day') "
+          "WHERE chat_id=%s", (days, chat_id), fetch=False)
 
 
 def active_centers() -> list[str]:
@@ -148,6 +179,47 @@ def kb_group(extra: list[InlineKeyboardButton] | None = None):
     return InlineKeyboardMarkup(rows)
 
 
+def btn_buy():
+    return InlineKeyboardButton(f"🔓 Открыть даты и ссылку — {STARS_PRICE} ⭐ / мес", callback_data="buy")
+
+
+def full_text(center: str, all_days: dict[str, list[str]], new_days: set[str] = frozenset()) -> str:
+    lines = [f"🟢 <b>{title(center)}</b> — есть свободные слоты!"]
+    for d in sorted(all_days):
+        t = all_days[d]
+        lines.append(("🆕 " if d in new_days else "") + d
+                     + (f": {', '.join(t[:8])}{'…' if len(t) > 8 else ''}" if t else ""))
+    lines.append("\n<i>Слоты разбирают быстро. Для зарубежных центров нужна верификация через Дію или BankID. "
+                 "Вопросы — в группе.</i>")
+    return "\n".join(lines)
+
+
+def teaser_text(center: str, all_days: dict[str, list[str]]) -> str:
+    n = len(all_days)
+    word = "дата" if n == 1 else ("даты" if 2 <= n <= 4 else "дат")
+    return (f"🟢 <b>{title(center)}</b> — появились свободные слоты: <b>{n} {word}</b>.\n\n"
+            f"Даты, время и ссылка на запись — в полной версии уведомлений.\n"
+            f"Подписка {STARS_PRICE} ⭐ в месяц: все уведомления по твоим центрам приходят сразу с датами и ссылкой.")
+
+
+async def send_invoice(bot, chat_id):
+    link = await bot.create_invoice_link(
+        title="Уведомления о слотах ДП «Документ»",
+        description=f"{PREMIUM_DAYS} дней: даты, время и ссылка на запись в каждом уведомлении по твоим центрам.",
+        payload=f"premium:{chat_id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice("Подписка на месяц", STARS_PRICE)],
+        subscription_period=SUB_PERIOD,
+    )
+    await bot.send_message(
+        chat_id,
+        f"Подписка на месяц — {STARS_PRICE} ⭐. Продлевается автоматически, отменить можно в настройках Telegram "
+        f"(Настройки → Мои звёзды).",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Оплатить {STARS_PRICE} ⭐", url=link)]]),
+    )
+
+
 def my_list(chat_id) -> str:
     mine = user_centers(chat_id)
     if not mine:
@@ -179,6 +251,7 @@ async def status(update: Update, ctx):
     mine = user_centers(update.effective_chat.id)
     if not mine:
         return await update.message.reply_text("Ты ни на что не подписан. /centers")
+    prem = is_premium(update.effective_chat.id)
     lines = []
     for c in sorted(mine):
         r = q("SELECT days, updated FROM center_state WHERE center=%s", (c,), one=True)
@@ -186,8 +259,15 @@ async def status(update: Update, ctx):
             lines.append(f"<b>{title(c)}</b>: ещё не проверял")
             continue
         age = int((time.time() - r[1]) / 60)
-        lines.append(f"<b>{title(c)}</b>: {', '.join(r[0]) if r[0] else 'нет слотов'} <i>({age} мин назад)</i>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        if not r[0]:
+            what = "нет слотов"
+        elif prem:
+            what = ", ".join(r[0])
+        else:
+            what = f"есть слоты ({len(r[0])} дат) — детали по подписке"
+        lines.append(f"<b>{title(c)}</b>: {what} <i>({age} мин назад)</i>")
+    markup = None if prem else InlineKeyboardMarkup([[btn_buy()]])
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def stats(update: Update, ctx):
@@ -195,9 +275,72 @@ async def stats(update: Update, ctx):
         return
     n_users = q("SELECT COUNT(*) FROM users", one=True)[0]
     n_subs = q("SELECT COUNT(DISTINCT chat_id) FROM subs", one=True)[0]
+    n_prem = q("SELECT COUNT(*) FROM users WHERE premium_until > now()", one=True)[0]
+    stars = q("SELECT COALESCE(SUM(stars),0) FROM payments", one=True)[0]
     per = q("SELECT center, COUNT(*) FROM subs GROUP BY center ORDER BY 2 DESC")
     await update.message.reply_text(
-        f"Всего в боте: {n_users}\nС подписками: {n_subs}\n\n" + "\n".join(f"{title(c)}: {k}" for c, k in per))
+        f"Всего в боте: {n_users}\nС подписками: {n_subs}\nПремиум активных: {n_prem}\nЗвёзд всего: {stars}\n\n"
+        + "\n".join(f"{title(c)}: {k}" for c, k in per))
+
+
+async def premium_cmd(update: Update, ctx):
+    cid = update.effective_chat.id
+    upsert_user(update.effective_user)
+    until = premium_until(cid)
+    if until and until.timestamp() > time.time():
+        return await update.message.reply_text(f"Подписка активна до {until.strftime('%d.%m.%Y')}.")
+    await send_invoice(ctx.bot, cid)
+
+
+async def grant_cmd(update: Update, ctx):
+    """/grant <chat_id> [дней] — выдать премиум вручную (для теста). Только админ."""
+    if update.effective_chat.id not in ADMIN_IDS:
+        return
+    try:
+        target = int(ctx.args[0]); days = int(ctx.args[1]) if len(ctx.args) > 1 else PREMIUM_DAYS
+    except (IndexError, ValueError):
+        return await update.message.reply_text("/grant <chat_id> [дней]")
+    q("INSERT INTO users (chat_id) VALUES (%s) ON CONFLICT DO NOTHING", (target,), fetch=False)
+    grant_premium(target, days)
+    await update.message.reply_text(f"Выдал {days} дн. для {target}, до {premium_until(target):%d.%m.%Y}")
+    try:
+        await ctx.bot.send_message(target, f"✅ Тебе включили полные уведомления на {days} дн.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def precheckout(update: Update, ctx):
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def on_paid(update: Update, ctx):
+    sp = update.message.successful_payment
+    cid = update.effective_chat.id
+    upsert_user(update.effective_user)
+    exp = sp.subscription_expiration_date  # datetime или None
+    if exp:
+        grant_premium(cid, PREMIUM_DAYS, until=exp)
+    else:
+        grant_premium(cid, PREMIUM_DAYS)
+    q("INSERT INTO payments (chat_id, stars, charge_id, recurring, expires_at) VALUES (%s,%s,%s,%s,%s)",
+      (cid, sp.total_amount, sp.telegram_payment_charge_id, bool(sp.is_recurring), exp), fetch=False)
+    log.info("payment %s stars from %s recurring=%s", sp.total_amount, cid, sp.is_recurring)
+    until = premium_until(cid)
+    await update.message.reply_text(
+        f"✅ Оплачено. Полные уведомления включены до {until:%d.%m.%Y}.\n"
+        f"Сейчас пришлю, что вижу по твоим центрам.")
+    # сразу показать текущее состояние
+    for c in sorted(user_centers(cid)):
+        r = q("SELECT days FROM center_state WHERE center=%s", (c,), one=True)
+        if r and r[0]:
+            await ctx.bot.send_message(cid, full_text(c, {d: [] for d in r[0]}), parse_mode=ParseMode.HTML,
+                                       disable_web_page_preview=True,
+                                       reply_markup=kb_group([InlineKeyboardButton("📝 Записаться на сайте", url=url(c))]))
+    for a in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(a, f"💫 Оплата {sp.total_amount} ⭐ от {cid} (@{update.effective_user.username})")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def on_callback(update: Update, ctx):
@@ -225,9 +368,16 @@ async def on_callback(update: Update, ctx):
             "поэтому держи уведомления включёнными.\n\n"
             "Бронируешь ты сам на сайте — для зарубежных центров нужна Дія или BankID.\n\n"
             "Вопросы по документам, записи, Дії или BankID — в нашей группе, там отвечают.\n\n"
+            f"Бесплатно: сообщу, что слоты появились. По подписке ({STARS_PRICE} ⭐/мес): "
+            "сразу даты, время и ссылка на запись — /premium.\n\n"
             "/centers — поменять города · /status — что я вижу сейчас · /stop — отписаться",
-            reply_markup=kb_group(),
+            reply_markup=kb_group([btn_buy()]),
         )
+    elif data == "buy":
+        await cq.answer()
+        if is_premium(cid):
+            return await cq.message.reply_text(f"Подписка уже активна до {premium_until(cid):%d.%m.%Y}.")
+        await send_invoice(ctx.bot, cid)
     elif data.startswith("t:"):
         sub = data[2:]
         if sub not in CENTERS:
@@ -239,20 +389,19 @@ async def on_callback(update: Update, ctx):
 
 # ---------- polling loop ----------
 async def notify(app: Application, center: str, new_days: set[str], all_days: dict[str, list[str]]):
-    lines = [f"🟢 <b>{title(center)}</b> — появились слоты!"]
-    for d in sorted(all_days):
-        t = all_days[d]
-        lines.append(("🆕 " if d in new_days else "") + d
-                     + (f": {', '.join(t[:8])}{'…' if len(t) > 8 else ''}" if t else ""))
-    lines.append("\n<i>Слоты разбирают быстро. Для зарубежных центров нужна верификация через Дію или BankID. "
-                 "Вопросы — в группе.</i>")
-    text = "\n".join(lines)
-    markup = kb_group([InlineKeyboardButton("📝 Записаться на сайте", url=url(center))])
+    text_full = full_text(center, all_days, new_days)
+    kb_full = kb_group([InlineKeyboardButton("📝 Записаться на сайте", url=url(center))])
+    text_teaser = teaser_text(center, all_days)
+    kb_teaser = kb_group([btn_buy()])
     sent = 0
-    for chat_id in subscribers(center):
+    for chat_id, prem in subscribers(center):
         try:
-            await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                       disable_web_page_preview=True, reply_markup=markup)
+            if prem:
+                await app.bot.send_message(chat_id, text_full, parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True, reply_markup=kb_full)
+            else:
+                await app.bot.send_message(chat_id, text_teaser, parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True, reply_markup=kb_teaser)
             q("UPDATE users SET last_notified_at=now() WHERE chat_id=%s", (chat_id,), fetch=False)
             sent += 1
             await asyncio.sleep(0.05)
@@ -341,7 +490,11 @@ def main():
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("premium", premium_cmd))
+    app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
     app.run_polling(drop_pending_updates=True)
 
 
